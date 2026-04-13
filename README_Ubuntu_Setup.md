@@ -1,4 +1,4 @@
-# Distributed Skyline Query System (Flink & Kafka)
+# Distributed Skyline Query Processing (Flink & Kafka)
 
 This project implements a distributed Skyline Query (Pareto Frontier) algorithm using **Apache Flink** for stream processing and **Apache Kafka** for data ingestion and result collection. The system includes a Python-based data generator, metrics collector, and visualization tools.
 
