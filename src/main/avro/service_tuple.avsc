@@ -1,0 +1,11 @@
+{
+  "type": "record",
+  "name": "ServiceTupleAvro",
+  "namespace": "org.main.avro",
+  "fields": [
+    {"name": "id", "type": "string"},
+    {"name": "values", "type": {"type": "array", "items": "double"}},
+    {"name": "originPartition", "type": "int", "default": -1},
+    {"name": "timestamp", "type": "long"}
+  ]
+}

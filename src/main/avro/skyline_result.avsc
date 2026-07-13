@@ -1,0 +1,17 @@
+{
+  "type": "record",
+  "name": "SkylineResultAvro",
+  "namespace": "org.main.avro",
+  "fields": [
+    {"name": "queryId", "type": "string"},
+    {"name": "recordCount", "type": "long"},
+    {"name": "skylineSize", "type": "int"},
+    {"name": "optimality", "type": "double"},
+    {"name": "ingestionTimeMs", "type": "long"},
+    {"name": "localProcessingTimeMs", "type": "long"},
+    {"name": "globalProcessingTimeMs", "type": "long"},
+    {"name": "totalProcessingTimeMs", "type": "long"},
+    {"name": "latencyMs", "type": "long"},
+    {"name": "pointsJson", "type": "string", "default": ""}
+  ]
+}

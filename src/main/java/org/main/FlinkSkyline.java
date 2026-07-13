@@ -14,12 +14,25 @@ import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
 import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.connector.kafka.source.KafkaSource;
 import org.apache.flink.connector.kafka.source.enumerator.initializer.OffsetsInitializer;
+import org.apache.flink.formats.avro.registry.confluent.ConfluentRegistryAvroDeserializationSchema;
+import org.apache.flink.formats.avro.registry.confluent.ConfluentRegistryAvroSerializationSchema;
+import org.apache.flink.api.common.functions.MapFunction;
 import org.apache.flink.streaming.api.datastream.DataStream;
 import org.apache.flink.streaming.api.datastream.KeyedStream;
+import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
 import org.apache.flink.streaming.api.functions.KeyedProcessFunction;
+import org.apache.flink.streaming.api.functions.ProcessFunction;
 import org.apache.flink.streaming.api.functions.co.CoProcessFunction;
+import org.apache.flink.streaming.api.functions.windowing.ProcessWindowFunction;
+import org.apache.flink.streaming.api.windowing.assigners.TumblingEventTimeWindows;
+import org.apache.flink.streaming.api.windowing.time.Time;
+import org.apache.flink.streaming.api.windowing.windows.TimeWindow;
 import org.apache.flink.util.Collector;
+import org.apache.flink.util.OutputTag;
+import org.main.avro.ServiceTupleAvro;
+import org.main.avro.QueryTriggerAvro;
+import org.main.avro.SkylineResultAvro;
 
 
 import java.io.Serializable;
@@ -71,9 +84,13 @@ public class FlinkSkyline {
         final String inputTopic = params.get("input-topic", "input-tuples");
         final String queryTopic = params.get("query-topic", "queries");
         final String outputTopic = params.get("output-topic", "output-skyline");
+        final String dlqTopic = params.get("dlq-topic", "input-tuples-dlq");
         final double domainMax = params.getDouble("domain", 1000.0);
         final int dims = params.getInt("dims", 2);
+        final long windowSizeMs = params.getLong("window-size-ms", 5000L);
+        final long idlenessSec = params.getLong("watermark.idleness-sec", 5L);
         final String bootstrapServers = params.get("bootstrap-servers", "localhost:9092");
+        final String schemaRegistryUrl = params.get("schema-registry-url", "http://localhost:8082");
 
         // Empirically(Based on the paper) partitions set to 2x number of nodes to ensure decent load distribution
         // even if data is skewed.
@@ -82,6 +99,7 @@ public class FlinkSkyline {
         // Initialize the StreamExecutionEnvironment. This is the context in which the program is executed.
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
+        env.getConfig().setGlobalJobParameters(params);
 
         // --- Fault Tolerance & Checkpointing ---
         if (params.getBoolean("checkpointing.enabled", false)) {
@@ -111,368 +129,153 @@ public class FlinkSkyline {
 
         // --- Kafka Sources Setup ---
         // Data Source: Read from earliest to ensure we process the full dataset for the experiment.
-        KafkaSource<String> tupleSrc = KafkaSource.<String>builder()
+        KafkaSource<ServiceTupleAvro> tupleSrc = KafkaSource.<ServiceTupleAvro>builder()
                 .setBootstrapServers(bootstrapServers)
                 .setTopics(inputTopic)
                 .setStartingOffsets(OffsetsInitializer.earliest())
-                .setValueOnlyDeserializer(new SimpleStringSchema())
+                .setValueOnlyDeserializer(
+                        ConfluentRegistryAvroDeserializationSchema.forSpecific(
+                                ServiceTupleAvro.class,
+                                schemaRegistryUrl
+                        )
+                )
                 .build();
 
         // Query Source: Read from latest. Acts as a control stream to trigger computation.
-        KafkaSource<String> querySrc = KafkaSource.<String>builder()
+        KafkaSource<QueryTriggerAvro> querySrc = KafkaSource.<QueryTriggerAvro>builder()
                 .setBootstrapServers(bootstrapServers)
                 .setTopics(queryTopic)
                 .setStartingOffsets(OffsetsInitializer.latest())
-                .setValueOnlyDeserializer(new SimpleStringSchema())
+                .setValueOnlyDeserializer(
+                        ConfluentRegistryAvroDeserializationSchema.forSpecific(
+                                QueryTriggerAvro.class,
+                                schemaRegistryUrl
+                        )
+                )
                 .build();
 
-        // Ingest the Data and Parse
-        // We use noWatermarks() here because this specific experiment relies on Record IDs for synchronization,
-        // rather than Event Time processing.
-        DataStream<ServiceTuple> rawData = env.fromSource(tupleSrc, org.apache.flink.api.common.eventtime.WatermarkStrategy.noWatermarks(), "Data")
-                .map(ServiceTuple::fromString)
-                .filter(Objects::nonNull); // Null safety for malformed CSV lines
+        // Ingest the Data and validate/route to DLQ
+        // We configure Flink Event Time and Watermark Strategy with Idleness support.
+        org.apache.flink.api.common.eventtime.WatermarkStrategy<ServiceTupleAvro> tupleWatermarkStrategy = 
+                org.apache.flink.api.common.eventtime.WatermarkStrategy
+                        .<ServiceTupleAvro>forMonotonousTimestamps()
+                        .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+                        .withIdleness(java.time.Duration.ofSeconds(idlenessSec));
+
+        org.apache.flink.api.common.eventtime.WatermarkStrategy<QueryTriggerAvro> queryWatermarkStrategy = 
+                org.apache.flink.api.common.eventtime.WatermarkStrategy
+                        .<QueryTriggerAvro>forMonotonousTimestamps()
+                        .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
+                        .withIdleness(java.time.Duration.ofSeconds(idlenessSec));
+
+        final OutputTag<ServiceTupleAvro> dlqTag = new OutputTag<ServiceTupleAvro>("input-tuples-dlq-tag") {};
+
+        SingleOutputStreamOperator<ServiceTuple> validatedData = env
+                .fromSource(tupleSrc, tupleWatermarkStrategy, "Data")
+                .process(new TupleValidator(dlqTag, dims))
+                .name("TupleValidator");
+
+        DataStream<ServiceTupleAvro> dlqStream = validatedData.getSideOutput(dlqTag);
+
+        // Sink DLQ records to Kafka DLQ Topic
+        dlqStream.sinkTo(KafkaSink.<ServiceTupleAvro>builder()
+                .setBootstrapServers(bootstrapServers)
+                .setRecordSerializer(KafkaRecordSerializationSchema.<ServiceTupleAvro>builder()
+                        .setTopic(dlqTopic)
+                        .setValueSerializationSchema(
+                                ConfluentRegistryAvroSerializationSchema.forSpecific(
+                                        ServiceTupleAvro.class,
+                                        dlqTopic + "-value",
+                                        schemaRegistryUrl
+                                )
+                        ).build())
+                .build())
+                .name("DLQSink");
 
         // Apply Partitioning Strategy
-        // This determines how the workload is distributed to the Local Processing nodes.
-        //DataStream<ServiceTuple> processedData = rawData; //this needs to be uncommented if we uncomment the grid filter
-        // This logic determines which worker node receives which data point.
         PartitioningLogic.SkylinePartitioner partitioner;
-
         switch (algo) {
             case "mr-dim":
-                // MR-Dim: Standard dimensional partitioning
-                // Slices space along the first dimension. Good for correlated data, bad for anti-correlated.
                 partitioner = new PartitioningLogic.DimPartitioner(numPartitions, domainMax);
                 break;
             case "mr-grid":
-                // MR-Grid:
-                // Prune dominated grids FIRST. This logic is a little complicated especially in >2d
-                // and especially because of the synchronization we do in the partitions.
-                // this logic might interfere with some other logic of our code and might cause a deadlock
-                // so we comment the next line for safety
-                // processedData = rawData.filter(new PartitioningLogic.GridDominanceFilter(domainMax, dims));
-
-                // Maps points to hypercube grid cells.
                 partitioner = new PartitioningLogic.GridPartitioner(numPartitions, domainMax, dims);
                 break;
             default:
-                // MR-Angle: Hyperspherical partitioning
-                // Maps points based on angular coordinates (Hyperspherical). Best for anti-correlated/circular distributions.
                 partitioner = new PartitioningLogic.AnglePartitioner(numPartitions, dims);
                 break;
         }
 
-        // Apply keyBy: This logically partitions the stream. All records with the same key
-        // (determined by the partitioner) are sent to the same physical operator instance.
-        KeyedStream<ServiceTuple, Integer> keyedData = rawData.keyBy(partitioner);
+        // Apply GridDominanceFilter if the algorithm is MR-Grid (Re-enabled & mathematically sound)
+        DataStream<ServiceTuple> processedData = validatedData;
+        if ("mr-grid".equals(algo)) {
+            processedData = validatedData.filter(new PartitioningLogic.GridDominanceFilter()).name("GridDominanceFilter");
+        }
 
-        // Query Trigger / Control Stream
-        // We broadcast the query trigger to ALL partitions. Each partition must report back
-        // its local status for the global aggregation to proceed.
-        // Input: Raw JSON String from Kafka.
-        // Output: Tuple3 <PartitionID (Target), QueryPayload, DispatchTime>
-        KeyedStream<Tuple3<Integer, String, Long>, Integer> keyedTriggers = env
-                .fromSource(querySrc, org.apache.flink.api.common.eventtime.WatermarkStrategy.noWatermarks(), "Queries")
-                .flatMap(new FlatMapFunction<String, Tuple3<Integer, String, Long>>() {
-                    @Override
-                    public void flatMap(String rawPayload, Collector<Tuple3<Integer, String, Long>> out) {
-                        long startTime = System.currentTimeMillis();
-                        // Broadcast query to all partitions
-                        for (int i = 0; i < numPartitions; i++) {
-                            out.collect(new Tuple3<>(i, rawPayload, startTime));
-                        }
-                    }
-                })
-                .keyBy(t -> t.f0); // Route trigger i to partition i
+        // Map tuples to PartitionEvent using KeySelector
+        DataStream<PartitionEvent> partitionedTuples = processedData.map(new MapFunction<ServiceTuple, PartitionEvent>() {
+            @Override
+            public PartitionEvent map(ServiceTuple value) throws Exception {
+                int key = partitioner.getKey(value);
+                return PartitionEvent.fromTuple(value, key);
+            }
+        }).name("TupleToPartitionEventMapper");
 
-        // Local Processing Phase(Connect Data & Queries)
-        // Connects the data stream with the control stream.(And sends them for local processing(BNL))
-        // The CoProcessFunction handles two different inputs sharing the same key.
-        DataStream<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> localSkylines = keyedData
-                .connect(keyedTriggers)
-                .process(new SkylineLocalProcessor())
-                .name("LocalSkylineProcessor");
+        // Read query triggers and broadcast to all partitions as PartitionEvent
+        DataStream<QueryTriggerAvro> queryStream = env.fromSource(querySrc, queryWatermarkStrategy, "Queries");
+        
+        DataStream<PartitionEvent> partitionedQueries = queryStream.flatMap(new FlatMapFunction<QueryTriggerAvro, PartitionEvent>() {
+            @Override
+            public void flatMap(QueryTriggerAvro trigger, Collector<PartitionEvent> out) {
+                for (int i = 0; i < numPartitions; i++) {
+                    out.collect(PartitionEvent.fromQuery(
+                            trigger.getQueryId().toString(),
+                            trigger.getRequiredCount(),
+                            i,
+                            trigger.getTimestamp()
+                    ));
+                }
+            }
+        }).name("QueryToPartitionEventMapper");
+
+        // Union both streams and key by partition ID
+        KeyedStream<PartitionEvent, Integer> keyedUnionStream = partitionedTuples
+                .union(partitionedQueries)
+                .keyBy(e -> e.partitionId);
+
+        // Local Processing Phase (Tumbling Window on Event Time)
+        DataStream<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> localSkylines = keyedUnionStream
+                .window(TumblingEventTimeWindows.of(Time.milliseconds(windowSizeMs)))
+                .process(new LocalSkylineWindowProcessor(dims))
+                .name("LocalSkylineWindowProcessor");
 
         // Global Aggregation Phase
         // Group by the QUERY STRING (f1) so all partial results for a specific query land on the same reducer.
         // We key by the Query String (f1) so that all partial results for the exact same query
         // end up at the same Reducer instance.
-        DataStream<String> finalResults = localSkylines
+        DataStream<SkylineResultAvro> finalResults = localSkylines
                 .keyBy(t -> t.f1) // Use f1 (Query String) as key
                 .process(new GlobalSkylineAggregator(numPartitions))
                 .name("GlobalReducer");
 
         // Sink Results to Kafka
-        finalResults.sinkTo(KafkaSink.<String>builder()
+        finalResults.sinkTo(KafkaSink.<SkylineResultAvro>builder()
                 .setBootstrapServers(bootstrapServers)
                 .setProperty("max.request.size", "10485760") // Increase max request size for large skyline payloads
-                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                .setRecordSerializer(KafkaRecordSerializationSchema.<SkylineResultAvro>builder()
                         .setTopic(outputTopic)
-                        .setValueSerializationSchema(new SimpleStringSchema()).build())
+                        .setValueSerializationSchema(
+                                ConfluentRegistryAvroSerializationSchema.forSpecific(
+                                        SkylineResultAvro.class,
+                                        outputTopic + "-value",
+                                        schemaRegistryUrl
+                                )
+                        ).build())
                 .build());
 
         env.execute("Flink Skyline: " + algo);
     }
 
-
-    /**
-     * Local Skyline Processor.
-     *
-     * A CoProcessFunction that manages two streams sharing the same Partition ID key:
-     * 1. Data Stream: Incoming tuples are buffered and reduced using the BNL algorithm.
-     * 2. Query Stream: Control signals that trigger the emission of the current local skyline.
-     *
-     * Synchronization Mechanism:
-     * To prevent "empty" reads in a streaming context, the query trigger contains a barrier ID.
-     * This processor will hold a query in a pending state until the maximum Record ID seen
-     * in the data stream meets or exceeds the barrier requirement.
-     *
-     * Inputs:
-     * - IN1: ServiceTuple (The data point).
-     * - IN2: Tuple3<Integer, String, Long> (PartitionID, Query Payload, Trigger Timestamp).
-     *
-     * Output:
-     * - Tuple6 containing:
-     * f0: PartitionID (Integer) - The worker ID.
-     * f1: QueryPayload (String) - The original query JSON/String.
-     * f2: TriggerDispatchTime (Long) - When the query was injected.
-     * f3: PartitionStartTime (Long) - When this worker began processing data.
-     * f4: List<ServiceTuple> - The calculated local skyline points.
-     * f5: LocalCPUTime (Long) - Total accumulated CPU time for BNL in milliseconds.
-     */
-    public static class SkylineLocalProcessor extends CoProcessFunction<ServiceTuple, Tuple3<Integer, String, Long>, Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> {
-
-        // --- Flink State Handles ---
-        // We use 'transient' because these fields are not serialized by Java serialization.
-        // Instead, they are initialized via the Flink RuntimeContext in the open() method.
-
-        // Candidate set for the local partition
-        private transient ListState<ServiceTuple> localSkylineState;
-        // Buffer for incoming tuples before batch processing
-        private transient List<ServiceTuple> inputBuffer;
-
-        // --- Synchronization & Metrics State ---
-        private transient ValueState<Long> maxSeenIdState;
-        private transient ListState<Tuple3<Integer, String, Long>> pendingQueriesState;
-        private transient ValueState<Long> startTimeState;
-        // Track accumulated CPU time for the algorithm
-        private transient ValueState<Long> accumulatedCpuNanosState;
-
-        private final int BUFFER_SIZE = 5000;
-
-        /**
-         * State Initialization.
-         * Sets up the handle accessors for Flink managed state (ListState, ValueState).
-         * This state is fault-tolerant and persists across checkpoints.
-         *
-         * @param config The Flink configuration context.
-         */
-        @Override
-        public void open(Configuration config) {
-            localSkylineState = getRuntimeContext().getListState(new ListStateDescriptor<>("localSky", ServiceTuple.class));
-            inputBuffer = new ArrayList<>();
-            startTimeState = getRuntimeContext().getState(new ValueStateDescriptor<>("jobStartTime", Long.class));
-            maxSeenIdState = getRuntimeContext().getState(new ValueStateDescriptor<>("maxId", Long.class));
-            pendingQueriesState = getRuntimeContext().getListState(new ListStateDescriptor<>("pendingQs", TypeInformation.of(new TypeHint<Tuple3<Integer, String, Long>>() {})));
-            accumulatedCpuNanosState = getRuntimeContext().getState(new ValueStateDescriptor<>("cpuTime", Long.class));
-        }
-
-
-        /**
-         * Data Stream Handler (Input 1).
-         *
-         * 1. Updates the maximum Record ID seen (for synchronization).
-         * 2. Buffers the tuple.
-         * 3. Triggers BNL processing if buffer exceeds threshold.
-         * 4. Checks if the new data satisfies any pending query barriers.
-         *
-         * @param point The incoming data tuple.
-         * @param ctx   Context for timer/side-output access.
-         * @param out   Collector to emit results (only used here if a pending query is unlocked).
-         */
-        @Override
-        public void processElement1(ServiceTuple point, Context ctx, Collector<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> out) throws Exception {
-            // Start Timer
-            long startNano = System.nanoTime();
-
-            // Initialize partition start time on first element
-            if (startTimeState.value() == null) {
-                startTimeState.update(System.currentTimeMillis());
-            }
-
-            // Update max ID seen (used for barrier synchronization)
-            // The Query Stream uses this to know if the partition has processed enough data.
-            long currentId = Long.parseLong(point.id);
-            Long maxIdWrapper = maxSeenIdState.value();
-            long maxId = (maxIdWrapper != null) ? maxIdWrapper : -1L;
-
-            if (currentId > maxId) {
-                maxSeenIdState.update(currentId);
-                maxId = currentId;
-            }
-
-            // Buffer data and trigger local Skyline computation (BNL) if buffer is fulls
-            inputBuffer.add(point);
-            if (inputBuffer.size() >= BUFFER_SIZE) {
-                processBuffer();
-            }
-
-            // Update CPU metrics
-            long duration = System.nanoTime() - startNano;
-            Long currentCpu = accumulatedCpuNanosState.value();
-            accumulatedCpuNanosState.update((currentCpu == null ? 0 : currentCpu) + duration);
-
-            // Barrier Check:
-            // Check if the arrival of this new data satisfies any queries that were waiting in the queue.
-            Iterable<Tuple3<Integer, String, Long>> pending = pendingQueriesState.get();
-            if (pending != null) {
-                List<Tuple3<Integer, String, Long>> remaining = new ArrayList<>();
-                boolean processedAny = false;
-                for (Tuple3<Integer, String, Long> query : pending) {
-                    String[] parts = query.f1.split(",");
-                    // The query payload is expected to be "QueryID,RequiredRecordCount"
-                    long requiredCount = (parts.length > 1) ? Long.parseLong(parts[1]) : 0;
-                    if (maxId >= requiredCount) {
-                        processQuery(query, out);
-                        processedAny = true;
-                    } else {
-                        remaining.add(query);
-                    }
-                }
-                // Update the state with queries that are still waiting
-                if (processedAny) pendingQueriesState.update(remaining);
-            }
-        }
-
-        /**
-         * Query Stream Handler (Input 2).
-         *
-         * Receives a trigger request. If the partition has processed enough data (RecordID >= Barrier),
-         * it executes the query immediately. Otherwise, the query is stored in the 'pendingQueriesState'
-         * queue.
-         *
-         * @param trigger Tuple3 containing <PartitionID, Payload ("ID,Count"), Timestamp>.
-         * @param ctx     Context.
-         * @param out     Collector to emit results.
-         */
-        @Override
-        public void processElement2(Tuple3<Integer, String, Long> trigger, Context ctx, Collector<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> out) throws Exception {
-
-            // Parse synchronization barrier from query payload (Format: "QueryID,RequiredCount")
-            String[] parts = trigger.f1.split(",");
-            long requiredCount = (parts.length > 1) ? Long.parseLong(parts[1]) : 0;
-            Long maxIdWrapper = maxSeenIdState.value();
-            long currentMaxId = (maxIdWrapper != null) ? maxIdWrapper : -1L;
-
-            //FOR DEBUGGING PURPOSES
-            //int pId = trigger.f0;
-            //System.out.println(">>> Partition " + pId + " Query Trigger. CurrentMaxID: " + currentMaxId + " | Required: " + requiredCount);
-
-            // If we have enough data(Or a partition is empty because of unbalanced partitioning,
-            // (Usually because of the use of anti correlated data)),
-            // process immediately. Otherwise, queue it.
-            // Synchronization Logic:
-            // If we have seen enough data (currentMaxId >= requiredCount), or if we are in an initial state (-1),
-            // (a partition is empty because of unbalanced partitioning,
-            //  Usually because of the use of anti correlated data)
-            // we process the query immediately.
-            // Otherwise, we store it in 'pendingQueriesState' to be re-evaluated when new data arrives.
-            if (currentMaxId >= requiredCount || currentMaxId == -1L) {
-                processQuery(trigger, out);
-            } else {
-                pendingQueriesState.add(trigger);
-            }
-        }
-
-        /**
-         * Query Executor.
-         *
-         * Finalizes the local skyline by flushing any remaining buffered items, tagging the results with
-         * the partition ID, and emitting the result package to the Global Aggregator.
-         *
-         * @param trigger The query trigger object.
-         * @param out     The output collector.
-         */
-        private void processQuery(Tuple3<Integer, String, Long> trigger, Collector<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> out) throws Exception {
-
-            // Start Timer for any remaining flush
-            long startNano = System.nanoTime();
-            // Flush remaining items in buffer to ensure the result is consistent with the received data
-            if (!inputBuffer.isEmpty()) {
-                processBuffer();
-            }
-            long duration = System.nanoTime() - startNano;
-            Long currentCpu = accumulatedCpuNanosState.value();
-            long totalCpuNanos = (currentCpu == null ? 0 : currentCpu) + duration;
-            accumulatedCpuNanosState.update(totalCpuNanos);
-
-            // Prepare Output Data
-            int partitionId = trigger.f0; // Identify which partition this is
-            String queryPayload = trigger.f1;
-            Long triggerDispatchTime = trigger.f2;
-            Long partitionStartTime = startTimeState.value();
-            if (partitionStartTime == null) partitionStartTime = System.currentTimeMillis();
-
-            List<ServiceTuple> results = new ArrayList<>();
-            for (ServiceTuple s : localSkylineState.get()) {
-                // Tagging origin is required for Global Optimality calculation
-                s.originPartition = partitionId;
-                results.add(s);
-            }
-
-            long totalCpuMillis = totalCpuNanos / 1_000_000L;
-
-            out.collect(new Tuple6<>(
-                    partitionId,
-                    queryPayload,
-                    triggerDispatchTime,
-                    partitionStartTime,
-                    results,
-                    totalCpuMillis
-            ));
-        }
-
-        /**
-         * Block Nested Loop (BNL) Algorithm.
-         *
-         * Compares the input buffer against the current skyline state.
-         * - If a new point is dominated by an existing point, discard the new point.
-         * - If a new point dominates an existing point, remove the existing point.
-         * - If neither dominates, keep both.
-         *
-         * Input: Internal 'inputBuffer' and 'localSkylineState'.
-         * Output: Updates 'localSkylineState' with the refined set of candidates.
-         */
-        private void processBuffer() throws Exception {
-            Iterable<ServiceTuple> stateIter = localSkylineState.get();
-            List<ServiceTuple> currentSkyline = new ArrayList<>();
-            if (stateIter != null) {
-                for (ServiceTuple s : stateIter) currentSkyline.add(s);
-            }
-
-            for (ServiceTuple candidate : inputBuffer) {
-                boolean isDominated = false;
-                Iterator<ServiceTuple> it = currentSkyline.iterator();
-                while (it.hasNext()) {
-                    ServiceTuple existing = it.next();
-                    if (existing.dominates(candidate)) {
-                        isDominated = true;
-                        break;
-                    }
-                    if (candidate.dominates(existing)) {
-                        // Existing point is dominated by new candidate; remove it.
-                        it.remove();
-                    }
-                }
-                if (!isDominated) {
-                    currentSkyline.add(candidate);
-                }
-            }
-            localSkylineState.update(currentSkyline);
-            inputBuffer.clear();
-        }
-    }
 
     /**
      * Global Skyline Aggregator.
@@ -487,7 +290,7 @@ public class FlinkSkyline {
      * Output:
      * - String: A JSON formatted string containing performance metrics and (optionally) the result points.
      */
-    public static class GlobalSkylineAggregator extends KeyedProcessFunction<String, Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>, String> {
+    public static class GlobalSkylineAggregator extends KeyedProcessFunction<String, Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>, SkylineResultAvro> {
 
         private final int totalPartitions;
 
@@ -517,12 +320,45 @@ public class FlinkSkyline {
 
         @Override
         public void open(Configuration config) {
-            globalBuffer = getRuntimeContext().getState(new ValueStateDescriptor<>("gBuffer", TypeInformation.of(new TypeHint<List<ServiceTuple>>() {})));
-            arrivedCount = getRuntimeContext().getState(new ValueStateDescriptor<>("cnt", Integer.class));
-            minStartTimeState = getRuntimeContext().getState(new ValueStateDescriptor<>("minStart", Long.class));
-            lastArrivalState = getRuntimeContext().getState(new ValueStateDescriptor<>("lastArr", Long.class));
-            maxLocalCpuState = getRuntimeContext().getState(new ValueStateDescriptor<>("maxCpu", Long.class));
-            localSkylineSizes = getRuntimeContext().getMapState(new MapStateDescriptor<>("localSizes", Integer.class, Integer.class));
+            org.apache.flink.api.common.ExecutionConfig executionConfig = 
+                    getRuntimeContext().getExecutionConfig();
+            org.apache.flink.api.common.ExecutionConfig.GlobalJobParameters globalParams = 
+                    executionConfig.getGlobalJobParameters();
+            
+            int ttlHours = 2;
+            if (globalParams instanceof org.apache.flink.api.java.utils.ParameterTool) {
+                ttlHours = ((org.apache.flink.api.java.utils.ParameterTool) globalParams).getInt("state.ttl-hours", 2);
+            }
+
+            StateTtlConfig ttlConfig = StateTtlConfig
+                    .newBuilder(org.apache.flink.api.common.time.Time.hours(ttlHours))
+                    .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+                    .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+                    .build();
+
+            ValueStateDescriptor<List<ServiceTuple>> gBufferDesc = new ValueStateDescriptor<>("gBuffer", TypeInformation.of(new TypeHint<List<ServiceTuple>>() {}));
+            gBufferDesc.enableTimeToLive(ttlConfig);
+            globalBuffer = getRuntimeContext().getState(gBufferDesc);
+
+            ValueStateDescriptor<Integer> cntDesc = new ValueStateDescriptor<>("cnt", Integer.class);
+            cntDesc.enableTimeToLive(ttlConfig);
+            arrivedCount = getRuntimeContext().getState(cntDesc);
+
+            ValueStateDescriptor<Long> minStartDesc = new ValueStateDescriptor<>("minStart", Long.class);
+            minStartDesc.enableTimeToLive(ttlConfig);
+            minStartTimeState = getRuntimeContext().getState(minStartDesc);
+
+            ValueStateDescriptor<Long> lastArrDesc = new ValueStateDescriptor<>("lastArr", Long.class);
+            lastArrDesc.enableTimeToLive(ttlConfig);
+            lastArrivalState = getRuntimeContext().getState(lastArrDesc);
+
+            ValueStateDescriptor<Long> maxCpuDesc = new ValueStateDescriptor<>("maxCpu", Long.class);
+            maxCpuDesc.enableTimeToLive(ttlConfig);
+            maxLocalCpuState = getRuntimeContext().getState(maxCpuDesc);
+
+            MapStateDescriptor<Integer, Integer> localSizesDesc = new MapStateDescriptor<>("localSizes", Integer.class, Integer.class);
+            localSizesDesc.enableTimeToLive(ttlConfig);
+            localSkylineSizes = getRuntimeContext().getMapState(localSizesDesc);
         }
 
 
@@ -542,7 +378,7 @@ public class FlinkSkyline {
          * @param out   Output collector for the final JSON string.
          */
         @Override
-        public void processElement(Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long> input, Context ctx, Collector<String> out) throws Exception {
+        public void processElement(Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long> input, Context ctx, Collector<SkylineResultAvro> out) throws Exception {
             List<ServiceTuple> currentGlobal = globalBuffer.value();
             if (currentGlobal == null) currentGlobal = new ArrayList<>();
 
@@ -637,47 +473,48 @@ public class FlinkSkyline {
                 }
                 double optimality = sumRatios / totalPartitions;
 
-                //remove comment if you want to visualise the points(its crashes if data>2mil)
                 // --- C. Visualization Data (Objective 1) ---
-//                StringBuilder pointsJson = new StringBuilder("[");
-//                for (int i = 0; i < currentGlobal.size(); i++) {
-//                    ServiceTuple s = currentGlobal.get(i);
-//                    pointsJson.append("[");
-//                    for(int j=0; j<s.values.length; j++) {
-//                        pointsJson.append(s.values[j]);
-//                        if(j < s.values.length - 1) pointsJson.append(",");
-//                    }
-//                    pointsJson.append("]");
-//                    if(i < currentGlobal.size() - 1) pointsJson.append(", ");
-//                }
-//                pointsJson.append("]");
+                // Capped visualization points to 500 to prevent overhead
+                int visualPointsCap = Math.min(currentGlobal.size(), 500);
+                StringBuilder pointsJson = new StringBuilder("[");
+                for (int i = 0; i < visualPointsCap; i++) {
+                    ServiceTuple s = currentGlobal.get(i);
+                    pointsJson.append("[");
+                    for(int j=0; j<s.values.length; j++) {
+                        pointsJson.append(s.values[j]);
+                        if(j < s.values.length - 1) pointsJson.append(",");
+                    }
+                    pointsJson.append("]");
+                    if(i < visualPointsCap - 1) pointsJson.append(", ");
+                }
+                pointsJson.append("]");
 
-                // --- Build JSON Payload ---
+                // --- Build Avro Result ---
                 String payload = ctx.getCurrentKey();   // "QueryID,RecordCount"
                 String[] parts = payload.split(",");
                 String qId = parts[0];
                 String recCount = (parts.length > 1) ? parts[1] : "unknown";
 
-                StringBuilder sb = new StringBuilder();
-                sb.append("{");
-                sb.append("\"query_id\": \"").append(qId).append("\", ");
-                sb.append("\"record_count\": ").append(recCount).append(", ");
-                sb.append("\"skyline_size\": ").append(currentGlobal.size()).append(", ");
-                sb.append("\"optimality\": ").append(String.format(java.util.Locale.US, "%.4f", optimality)).append(", ");
+                long recordCountVal = -1L;
+                try {
+                    recordCountVal = Long.parseLong(recCount);
+                } catch (NumberFormatException e) {
+                    // Ignore, keep -1L
+                }
 
-                sb.append("\"ingestion_time_ms\": ").append(ingestionTime).append(", ");
-                sb.append("\"local_processing_time_ms\": ").append(localProcessingTime).append(", ");
-                sb.append("\"global_processing_time_ms\": ").append(globalProcessingTime).append(", ");
-                sb.append("\"total_processing_time_ms\": ").append(totalProcessingTime);//.append(", ");
+                SkylineResultAvro resultRecord = new SkylineResultAvro();
+                resultRecord.setQueryId(qId);
+                resultRecord.setRecordCount(recordCountVal);
+                resultRecord.setSkylineSize(currentGlobal.size());
+                resultRecord.setOptimality(optimality);
+                resultRecord.setIngestionTimeMs(ingestionTime);
+                resultRecord.setLocalProcessingTimeMs(localProcessingTime);
+                resultRecord.setGlobalProcessingTimeMs(globalProcessingTime);
+                resultRecord.setTotalProcessingTimeMs(totalProcessingTime);
+                resultRecord.setLatencyMs(queryLatency);
+                resultRecord.setPointsJson(pointsJson.toString());
 
-                // NOTE: Detailed skyline points excluded from JSON to prevent OOM on large datasets (>2mil records)
-                // Uncomment 'pointsJson' logic if visualization is required for small subsets.
-                // Also uncomment the line below
-                //sb.append("\"skyline_points\": ").append(pointsJson.toString());
-
-                sb.append("}");
-
-                out.collect(sb.toString());
+                out.collect(resultRecord);
 
                 // Reset state for next query on this key
                 globalBuffer.clear();
@@ -685,6 +522,321 @@ public class FlinkSkyline {
                 lastArrivalState.clear();
                 maxLocalCpuState.clear();
                 localSkylineSizes.clear();
+            }
+        }
+    }
+
+    /**
+     * Tuple Validator & DLQ Router.
+     *
+     * Validates incoming ServiceTupleAvro elements:
+     * - Ensures the record is not null.
+     * - Ensures ID is present and not empty.
+     * - Ensures values are present and not empty.
+     * - Ensures no value within dimensions is null.
+     *
+     * Valid records are mapped to ServiceTuple and emitted to the main stream.
+     * Invalid/malformed records are directed to a Dead Letter Queue (DLQ) side output.
+     */
+    public static class TupleValidator extends ProcessFunction<ServiceTupleAvro, ServiceTuple> {
+        private final OutputTag<ServiceTupleAvro> dlqTag;
+        private final int expectedDims;
+
+        public TupleValidator(OutputTag<ServiceTupleAvro> dlqTag, int expectedDims) {
+            this.dlqTag = dlqTag;
+            this.expectedDims = expectedDims;
+        }
+
+        @Override
+        public void processElement(ServiceTupleAvro value, Context ctx, Collector<ServiceTuple> out) throws Exception {
+            if (value == null) {
+                return;
+            }
+
+            boolean isValid = true;
+            try {
+                if (value.getId() == null || value.getId().toString().trim().isEmpty()) {
+                    isValid = false;
+                }
+                
+                if (value.getValues() == null || value.getValues().size() != expectedDims) {
+                    isValid = false;
+                } else {
+                    for (Double val : value.getValues()) {
+                        if (val == null) {
+                            isValid = false;
+                            break;
+                        }
+                    }
+                }
+
+                if (isValid) {
+                    ServiceTuple parsed = ServiceTuple.fromAvro(value);
+                    if (parsed != null) {
+                        out.collect(parsed);
+                    } else {
+                        ctx.output(dlqTag, value);
+                    }
+                } else {
+                    ctx.output(dlqTag, value);
+                }
+            } catch (Exception e) {
+                ctx.output(dlqTag, value);
+            }
+        }
+    }
+
+    /**
+     * Common event class representing either a Tuple or a Query trigger for window processing.
+     */
+    public static class PartitionEvent implements Serializable {
+        public int partitionId;
+        public boolean isQuery;
+        public ServiceTuple tuple;
+        public String queryId;
+        public long requiredCount;
+        public long timestamp;
+
+        public PartitionEvent() {}
+
+        public static PartitionEvent fromTuple(ServiceTuple tuple, int partitionId) {
+            PartitionEvent e = new PartitionEvent();
+            e.partitionId = partitionId;
+            e.isQuery = false;
+            e.tuple = tuple;
+            e.timestamp = tuple.timestamp;
+            return e;
+        }
+
+        public static PartitionEvent fromQuery(String queryId, long requiredCount, int partitionId, long timestamp) {
+            PartitionEvent e = new PartitionEvent();
+            e.partitionId = partitionId;
+            e.isQuery = true;
+            e.queryId = queryId;
+            e.requiredCount = requiredCount;
+            e.timestamp = timestamp;
+            return e;
+        }
+    }
+
+    /**
+     * In-memory K-Dimensional Tree (KD-Tree) for fast multi-dimensional skyline dominance checking.
+     */
+    public static class KDTree implements Serializable {
+        public static class Node implements Serializable {
+            public ServiceTuple point;
+            public Node left;
+            public Node right;
+            public int splitDim;
+
+            public Node(ServiceTuple point, int splitDim) {
+                this.point = point;
+                this.splitDim = splitDim;
+            }
+        }
+
+        private Node root;
+        private final int dims;
+
+        public KDTree(int dims) {
+            this.dims = dims;
+        }
+
+        public void insert(ServiceTuple point) {
+            root = insertRec(root, point, 0);
+        }
+
+        private Node insertRec(Node root, ServiceTuple point, int depth) {
+            if (root == null) {
+                return new Node(point, depth % dims);
+            }
+
+            int cd = depth % dims;
+            if (point.values[cd] < root.point.values[cd]) {
+                root.left = insertRec(root.left, point, depth + 1);
+            } else {
+                root.right = insertRec(root.right, point, depth + 1);
+            }
+            return root;
+        }
+
+        public boolean isDominated(ServiceTuple candidate) {
+            return isDominatedRec(root, candidate);
+        }
+
+        private boolean isDominatedRec(Node node, ServiceTuple candidate) {
+            if (node == null) return false;
+
+            if (node.point.dominates(candidate)) {
+                return true;
+            }
+
+            int cd = node.splitDim;
+            if (candidate.values[cd] < node.point.values[cd]) {
+                if (isDominatedRec(node.left, candidate)) return true;
+            } else {
+                if (isDominatedRec(node.left, candidate)) return true;
+                if (isDominatedRec(node.right, candidate)) return true;
+            }
+            return false;
+        }
+
+        public void rebuild(List<ServiceTuple> points) {
+            root = buildTree(points, 0);
+        }
+
+        private Node buildTree(List<ServiceTuple> points, int depth) {
+            if (points.isEmpty()) return null;
+
+            int cd = depth % dims;
+            points.sort((a, b) -> Double.compare(a.values[cd], b.values[cd]));
+            int medianIdx = points.size() / 2;
+
+            Node node = new Node(points.get(medianIdx), cd);
+            node.left = buildTree(new ArrayList<>(points.subList(0, medianIdx)), depth + 1);
+            node.right = buildTree(new ArrayList<>(points.subList(medianIdx + 1, points.size())), depth + 1);
+            return node;
+        }
+    }
+
+    /**
+     * Flink window process function that executes the local skyline query computation
+     * on partitioned streams.
+     */
+    public static class LocalSkylineWindowProcessor 
+            extends ProcessWindowFunction<PartitionEvent, Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>, Integer, TimeWindow> {
+
+        private transient ListState<ServiceTuple> localSkylineState;
+        private transient ValueState<Long> startTimeState;
+        private transient ValueState<Long> accumulatedCpuNanosState;
+        private final int dims;
+
+        public LocalSkylineWindowProcessor(int dims) {
+            this.dims = dims;
+        }
+
+        @Override
+        public void open(Configuration config) throws Exception {
+            org.apache.flink.api.common.ExecutionConfig executionConfig = 
+                    getRuntimeContext().getExecutionConfig();
+            org.apache.flink.api.common.ExecutionConfig.GlobalJobParameters globalParams = 
+                    executionConfig.getGlobalJobParameters();
+            
+            int ttlHours = 2;
+            if (globalParams instanceof org.apache.flink.api.java.utils.ParameterTool) {
+                ttlHours = ((org.apache.flink.api.java.utils.ParameterTool) globalParams).getInt("state.ttl-hours", 2);
+            }
+
+            StateTtlConfig ttlConfig = StateTtlConfig
+                    .newBuilder(org.apache.flink.api.common.time.Time.hours(ttlHours))
+                    .setUpdateType(StateTtlConfig.UpdateType.OnCreateAndWrite)
+                    .setStateVisibility(StateTtlConfig.StateVisibility.NeverReturnExpired)
+                    .build();
+
+            ListStateDescriptor<ServiceTuple> desc = new ListStateDescriptor<>("localSky", ServiceTuple.class);
+            desc.enableTimeToLive(ttlConfig);
+            localSkylineState = getRuntimeContext().getListState(desc);
+
+            startTimeState = getRuntimeContext().getState(new ValueStateDescriptor<>("jobStartTime", Long.class));
+            accumulatedCpuNanosState = getRuntimeContext().getState(new ValueStateDescriptor<>("cpuTime", Long.class));
+        }
+
+        @Override
+        public void process(
+                Integer partitionId,
+                Context context,
+                Iterable<PartitionEvent> elements,
+                Collector<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> out) throws Exception {
+
+            long startNano = System.nanoTime();
+
+            if (startTimeState.value() == null) {
+                startTimeState.update(System.currentTimeMillis());
+            }
+
+            Iterable<ServiceTuple> stateIter = localSkylineState.get();
+            List<ServiceTuple> currentSkyline = new ArrayList<>();
+            if (stateIter != null) {
+                for (ServiceTuple s : stateIter) {
+                    currentSkyline.add(s);
+                }
+            }
+
+            List<ServiceTuple> incomingTuples = new ArrayList<>();
+            List<PartitionEvent> queries = new ArrayList<>();
+            for (PartitionEvent event : elements) {
+                if (event.isQuery) {
+                    queries.add(event);
+                } else if (event.tuple != null) {
+                    incomingTuples.add(event.tuple);
+                }
+            }
+
+            if (!incomingTuples.isEmpty()) {
+                KDTree tree = new KDTree(dims);
+                if (!currentSkyline.isEmpty()) {
+                    tree.rebuild(new ArrayList<>(currentSkyline));
+                }
+
+                List<ServiceTuple> newSurvivors = new ArrayList<>();
+                for (ServiceTuple candidate : incomingTuples) {
+                    if (currentSkyline.isEmpty() || !tree.isDominated(candidate)) {
+                        Iterator<ServiceTuple> it = currentSkyline.iterator();
+                        while (it.hasNext()) {
+                            if (candidate.dominates(it.next())) {
+                                it.remove();
+                            }
+                        }
+                        boolean isDominatedByNew = false;
+                        Iterator<ServiceTuple> itNew = newSurvivors.iterator();
+                        while (itNew.hasNext()) {
+                            ServiceTuple ns = itNew.next();
+                            if (ns.dominates(candidate)) {
+                                isDominatedByNew = true;
+                                break;
+                            }
+                            if (candidate.dominates(ns)) {
+                                itNew.remove();
+                            }
+                        }
+                        if (!isDominatedByNew) {
+                            newSurvivors.add(candidate);
+                        }
+                    }
+                }
+                currentSkyline.addAll(newSurvivors);
+                localSkylineState.update(currentSkyline);
+            }
+
+            long duration = System.nanoTime() - startNano;
+            Long currentCpu = accumulatedCpuNanosState.value();
+            long totalCpuNanos = (currentCpu == null ? 0 : currentCpu) + duration;
+            accumulatedCpuNanosState.update(totalCpuNanos);
+
+            if (!queries.isEmpty()) {
+                long partitionStartTime = startTimeState.value();
+                long totalCpuMillis = totalCpuNanos / 1_000_000L;
+
+                for (PartitionEvent query : queries) {
+                    String queryPayload = query.queryId + "," + query.requiredCount;
+                    long triggerDispatchTime = query.timestamp;
+
+                    List<ServiceTuple> results = new ArrayList<>();
+                    for (ServiceTuple s : currentSkyline) {
+                        ServiceTuple copy = new ServiceTuple(s.id, s.values, s.timestamp);
+                        copy.originPartition = partitionId;
+                        results.add(copy);
+                    }
+
+                    out.collect(new Tuple6<>(
+                            partitionId,
+                            queryPayload,
+                            triggerDispatchTime,
+                            partitionStartTime,
+                            results,
+                            totalCpuMillis
+                    ));
+                }
             }
         }
     }
@@ -744,24 +896,71 @@ public class FlinkSkyline {
 
 
         // --- MR-Grid Dominance Filter ---
-//        public static class GridDominanceFilter extends RichFilterFunction<ServiceTuple> {
-//            private final double threshold;
-//            public GridDominanceFilter(double maxVal, int dims) {
-//                this.threshold = maxVal / 2.0;
-//            }
-//            @Override
-//            public boolean filter(ServiceTuple t) {
-//                boolean allWorse = true;
-//                for(double v : t.values) {
-//                    if (v < threshold) {
-//                        allWorse = false;
-//                        break;
-//                    }
-//                }
-//                return !allWorse;
-//            }
-//        }
-//
+        public static class GridDominanceFilter extends RichFilterFunction<ServiceTuple> {
+            private transient ListState<ServiceTuple> pruningState;
+            private final int maxPruningPoints = 50;
+
+            @Override
+            public void open(Configuration config) throws Exception {
+                pruningState = getRuntimeContext().getListState(
+                        new ListStateDescriptor<>("pruningPoints", ServiceTuple.class)
+                );
+            }
+
+            @Override
+            public boolean filter(ServiceTuple t) throws Exception {
+                Iterable<ServiceTuple> stateIter = pruningState.get();
+                List<ServiceTuple> pruningPoints = new ArrayList<>();
+                if (stateIter != null) {
+                    for (ServiceTuple p : stateIter) {
+                        pruningPoints.add(p);
+                    }
+                }
+
+                boolean isDominated = false;
+                Iterator<ServiceTuple> it = pruningPoints.iterator();
+                while (it.hasNext()) {
+                    ServiceTuple p = it.next();
+                    if (p.dominates(t)) {
+                        isDominated = true;
+                        break;
+                    }
+                    if (t.dominates(p)) {
+                        it.remove();
+                    }
+                }
+
+                if (isDominated) {
+                    pruningState.update(pruningPoints);
+                    return false;
+                }
+
+                if (pruningPoints.size() < maxPruningPoints) {
+                    pruningPoints.add(t);
+                } else {
+                    int worstIdx = -1;
+                    double maxSum = -1.0;
+                    double tSum = 0.0;
+                    for (double v : t.values) tSum += v;
+
+                    for (int i = 0; i < pruningPoints.size(); i++) {
+                        double sum = 0.0;
+                        for (double v : pruningPoints.get(i).values) sum += v;
+                        if (sum > maxSum) {
+                            maxSum = sum;
+                            worstIdx = i;
+                        }
+                    }
+
+                    if (tSum < maxSum && worstIdx != -1) {
+                        pruningPoints.set(worstIdx, t);
+                    }
+                }
+
+                pruningState.update(pruningPoints);
+                return true;
+            }
+        }
 
         /**
          * MR-Grid Partitioner.
@@ -807,15 +1006,14 @@ public class FlinkSkyline {
                 // Loop through all dimensions.
                 // Generate a bitmask based on which "side" of the midpoint the value falls.
                 // Example in 2D: 00 (bottom-left), 01 (bottom-right), 10 (top-left), 11 (top-right).
-                for (int i = 0; i < t.values.length; i++) {
+                for (int i = 0; i < Math.min(t.values.length, mids.length); i++) {
                     // If dimension i is in the upper half, set bit i to 1
                     if (t.values[i] >= mids[i]) {
                         mask |= (1 << i);
                     }
                 }
-                // Map the resulting cell ID (mask) directly to a worker partition
-                // Note for self: Ensure 'partitions' >= 2^dims for this to utilize all workers effectively
-                return mask;
+                // Map the resulting cell ID (mask) to a valid partition ID in range [0, partitions - 1]
+                return mask % partitions;
             }
         }
 

@@ -1,15 +1,75 @@
-# Agentic files
+# ==============================================================================
+# DISTRIBUTED SKYLINE PROCESSING - GITIGNORE
+# ==============================================================================
+
+# --- Agentic/AI Tools ---
 .antigravityignore
 .graphifyignore
 graphify-out/
 
-# Maven/Java
+# --- IDEs and Editor Files ---
+# IntelliJ IDEA
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Visual Studio Code
+.vscode/
+!.vscode/extensions.json
+
+# Eclipse
+.classpath
+.project
+.settings/
+
+# General editor backups/swap files
+*.swp
+*.swo
+*~
+
+# --- OS-specific files ---
+.DS_Store
+.DS_Store?
+._*
+Thumbs.db
+desktop.ini
+
+# --- Java / Maven ---
 target/
 *.class
+dependency-reduced-pom.xml
 
-# Python
+# --- Python ---
 __pycache__/
 *.py[cod]
 *$py.class
+.pytest_cache/
+.ipynb_checkpoints/
 venv/
 .venv/
+env/
+/python/__pycache__/
+
+# --- Node / Vite (Dashboard) ---
+# Main dashboard dependencies and builds are handled in dashboard/.gitignore,
+# but we add them here as a safety measure for root-level or nested structures.
+node_modules/
+dist/
+dist-ssr/
+*.local
+
+# --- Logs and Generated Artifacts ---
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Project/Benchmark Outputs ---
+# Python scripts generate CSV and PNG results in root and python/ directories, which shouldn't be tracked.
+# We target these directories specifically so that UI assets (e.g. dashboard/src/assets/hero.png) are not ignored.
+/*.csv
+/python/*.csv
+/*.png
+/python/*.png

@@ -1,0 +1,10 @@
+{
+  "type": "record",
+  "name": "QueryTriggerAvro",
+  "namespace": "org.main.avro",
+  "fields": [
+    {"name": "queryId", "type": "string"},
+    {"name": "requiredCount", "type": "long"},
+    {"name": "timestamp", "type": "long"}
+  ]
+}

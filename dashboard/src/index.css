@@ -1,0 +1,40 @@
+@import "tailwindcss";
+
+:root {
+  --bg: #111318;
+  --surface: #1a1d24;
+  --surface-alt: #1f2330;
+  --border: #2e3340;
+  --text: #d1d5db;
+  --text-muted: #6b7280;
+  --text-bright: #f9fafb;
+  --accent: #e35a4a;
+  --accent-blue: #4a9eff;
+  --accent-green: #3cb371;
+  --accent-yellow: #f5a030;
+}
+
+* {
+  box-sizing: border-box;
+  border-radius: 0 !important;
+}
+
+body {
+  margin: 0;
+  font-family: 'Menlo', 'Monaco', 'Consolas', 'Liberation Mono', 'Courier New', monospace;
+  background: var(--bg);
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+/* Reset recharts default styles */
+.recharts-cartesian-axis-tick text {
+  fill: var(--text-muted) !important;
+  font-size: 11px !important;
+  font-family: inherit !important;
+}
+.recharts-legend-item-text {
+  color: var(--text-muted) !important;
+  font-size: 11px !important;
+}

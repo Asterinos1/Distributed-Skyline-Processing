@@ -35,6 +35,12 @@ public class ServiceTuple implements Serializable {
     public int originPartition = -1;
 
     /**
+     * Timestamp of when the tuple was generated/ingested.
+     * Crucial for Event Time and Watermark alignment in Phase 4.
+     */
+    public long timestamp = 0L;
+
+    /**
      * Default constructor for serialization/deserialization frameworks (e.g., Flink POJO serialization).
      */
     public ServiceTuple() {}
@@ -46,8 +52,44 @@ public class ServiceTuple implements Serializable {
      * @param values Double array representing the dimensions.
      */
     public ServiceTuple(String id, double[] values) {
+        this(id, values, 0L);
+    }
+
+    /**
+     * Full Parameterized Constructor.
+     *
+     * @param id        Unique record identifier.
+     * @param values    Double array representing the dimensions.
+     * @param timestamp Generation timestamp.
+     */
+    public ServiceTuple(String id, double[] values, long timestamp) {
         this.id = id;
         this.values = values;
+        this.timestamp = timestamp;
+    }
+
+    /**
+     * Map from generated Avro record to internal ServiceTuple POJO.
+     */
+    public static ServiceTuple fromAvro(org.main.avro.ServiceTupleAvro avro) {
+        double[] vals = new double[avro.getValues().size()];
+        for (int i = 0; i < vals.length; i++) {
+            vals[i] = avro.getValues().get(i);
+        }
+        ServiceTuple t = new ServiceTuple(avro.getId().toString(), vals, avro.getTimestamp());
+        t.originPartition = avro.getOriginPartition();
+        return t;
+    }
+
+    /**
+     * Map from internal ServiceTuple POJO to generated Avro record.
+     */
+    public org.main.avro.ServiceTupleAvro toAvro() {
+        java.util.List<Double> valsList = new java.util.ArrayList<>(values.length);
+        for (double val : values) {
+            valsList.add(val);
+        }
+        return new org.main.avro.ServiceTupleAvro(id, valsList, originPartition, timestamp);
     }
 
     /**

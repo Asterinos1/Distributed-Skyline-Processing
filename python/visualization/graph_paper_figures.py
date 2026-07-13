@@ -68,7 +68,7 @@ def plot_paper_figures():
     
     plt.title("Processing Time vs Dimensionality (Cardinality 1 Million)")
     plt.xlabel("Dimensions")
-    plt.ylabel("Processing Time (s)")
+    plt.ylabel("Processing Time (ms)")
     plt.xticks(dimensions)
     plt.legend()
     plt.grid(True)

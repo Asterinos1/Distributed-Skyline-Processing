@@ -1,19 +1,20 @@
-from kafka import KafkaProducer
+from confluent_kafka import Producer
+from confluent_kafka.serialization import SerializationContext, MessageField
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
 from faker import Faker
 from enum import Enum
 from sys import argv
-import json
+import os
+import time
 
 """
-Synthetic Data Stream Generator (Simple Version).
+Synthetic Data Stream Generator (Avro Version).
 
 This script serves as a lightweight data producer for the Flink Skyline Experiment.
 It continuously generates synthetic multi-dimensional data points using three distinct 
 statistical distributions (Uniform, Correlated, Anti-Correlated) and pushes them 
-to a specified Kafka topic. 
-
-Unlike the more complex generator, this version focuses solely on data ingestion 
-throughput and does not inject control signals or query triggers.
+to a specified Kafka topic using Avro serialization.
 """
 
 class GenMethod(Enum):
@@ -34,26 +35,20 @@ class GenMethod(Enum):
         """
         return cls(label.lower())
 
+def load_schema(schema_name):
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    schema_path = os.path.join(script_dir, "..", "..", "src", "main", "avro", schema_name)
+    with open(schema_path, "r") as f:
+        return f.read()
+
 """
 Generates a data point with independent random values for each dimension.
-
-This function creates a vector where every dimension is selected uniformly at random
-from the specified domain range. This represents a standard random distribution
-where no specific relationship exists between the dimensions.
 """
 def generate_uniform_data(faker, dimensions, d_min, d_max):
     return [faker.random_int(min=d_min, max=d_max) for _ in range(dimensions)]
 
 """
 Generates a data point where dimensions are positively correlated.
-
-The logic first selects a random 'base' value from the domain. It then generates
-each dimension for the tuple by adding a small random offset to this base value.
-The offset is constrained to ten percent of the total domain range.
-
-The resulting points cluster tightly along the diagonal of the data space. This 
-distribution typically results in a very small Skyline size because points with 
-low base values tend to dominate the majority of the dataset.
 """
 def generate_correlated_data(faker, dimensions, d_min, d_max):
     base = faker.random_int(min=d_min, max=d_max)
@@ -65,14 +60,6 @@ def generate_correlated_data(faker, dimensions, d_min, d_max):
 
 """
 Generates a data point where dimensions are negatively correlated.
-
-This function attempts to place points on a hyperplane where the sum of all dimensions
-remains roughly constant. It achieves this by generating a random vector and scaling it
-so that its sum matches a target value (the average sum of the domain).
-
-Points generated using this method cluster along the anti-diagonal. This represents the
-most challenging scenario for Skyline computation because a point that is good in one
-dimension is likely bad in others, resulting in very few dominance relationships.
 """
 def generate_anti_correlated_data(faker, dimensions, d_min, d_max):
     rand_vals = [faker.random.random() for _ in range(dimensions)]
@@ -89,15 +76,6 @@ def generate_anti_correlated_data(faker, dimensions, d_min, d_max):
 
 """
 Main Execution Loop.
-
-This function orchestrates the data generation process. It begins by parsing the 
-command-line arguments to configure the Kafka topic, generation method, dimensionality, 
-and domain boundaries.
-
-Once configured, it initializes a Kafka Producer and enters an infinite loop. 
-In each iteration, it generates a single tuple using the selected statistical method,
-serializes it into a CSV format string (ID, Val1, Val2...), and emits it to the 
-Kafka broker. Progress is logged to the console every one hundred thousand records.
 """
 def generate_data():
     faker = Faker()
@@ -111,10 +89,15 @@ def generate_data():
 
     generation_method = GenMethod.from_str(method_str)
     
-    # Initialize connection to local Kafka Broker
-    prod = KafkaProducer(bootstrap_servers="localhost:9092")
+    # Initialize Schema Registry client and Avro Serializer
+    schema_registry_client = SchemaRegistryClient({'url': 'http://localhost:8082'})
+    schema_str = load_schema("service_tuple.avsc")
+    avro_serializer = AvroSerializer(schema_registry_client, schema_str)
 
-    print(f"Starting {generation_method.value} stream...")
+    # Initialize connection to local Kafka Broker
+    prod = Producer({'bootstrap.servers': 'localhost:9092'})
+
+    print(f"Starting {generation_method.value} stream in Avro format...")
 
     try:
         point_id = 0
@@ -127,22 +110,31 @@ def generate_data():
             else:
                 data = generate_anti_correlated_data(faker, dimensions, d_min, d_max)
 
-            # Construct CSV Payload: "ID,Dim1,Dim2,Dim3..."
-            payload = f"{point_id}," + ",".join(map(str, data))
+            # Construct Avro Record dict
+            record = {
+                "id": str(point_id),
+                "values": [float(v) for v in data],
+                "originPartition": -1,
+                "timestamp": int(time.time() * 1000)
+            }
             
+            # Serialize
+            serialized_value = avro_serializer(record, SerializationContext(topic_name, MessageField.VALUE))
+
             # Send serialized bytes to Kafka
-            prod.send(topic_name, value=payload.encode('utf-8'))
+            prod.produce(topic_name, value=serialized_value)
 
             # Periodic progress logging
             if point_id % 100000 == 0:
                 print(f"Sent {point_id} records...")
+                prod.flush()
             point_id += 1
             
     except KeyboardInterrupt:
         print("Stopping.")
     finally:
-        # Resource Cleanup: Close the producer connection cleanly
-        prod.close()
+        # Resource Cleanup: Flush producer before exit
+        prod.flush()
 
 if __name__ == '__main__':
     generate_data()
