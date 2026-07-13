@@ -59,7 +59,10 @@ public class FlinkSkyline {
      * @throws Exception Flink execution exceptions.
      */
     public static void main(String[] args) throws Exception {
-        final ParameterTool params = ParameterTool.fromArgs(args);
+        ParameterTool params = ParameterTool.fromArgs(args);
+        if (params.has("config")) {
+            params = ParameterTool.fromPropertiesFile(params.get("config")).mergeWith(params);
+        }
 
         // --- Parameters ---
         // --- Configuration & Tuning ---
@@ -70,6 +73,7 @@ public class FlinkSkyline {
         final String outputTopic = params.get("output-topic", "output-skyline");
         final double domainMax = params.getDouble("domain", 1000.0);
         final int dims = params.getInt("dims", 2);
+        final String bootstrapServers = params.get("bootstrap-servers", "localhost:9092");
 
         // Empirically(Based on the paper) partitions set to 2x number of nodes to ensure decent load distribution
         // even if data is skewed.
@@ -79,10 +83,36 @@ public class FlinkSkyline {
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
 
+        // --- Fault Tolerance & Checkpointing ---
+        if (params.getBoolean("checkpointing.enabled", false)) {
+            long checkpointInterval = params.getLong("checkpointing.interval-ms", 60000L);
+            env.enableCheckpointing(checkpointInterval);
+            env.getCheckpointConfig().setCheckpointingMode(org.apache.flink.streaming.api.CheckpointingMode.EXACTLY_ONCE);
+            env.getCheckpointConfig().setMinPauseBetweenCheckpoints(params.getLong("checkpointing.min-pause-ms", 30000L));
+            env.getCheckpointConfig().setCheckpointTimeout(params.getLong("checkpointing.timeout-ms", 600000L));
+            env.getCheckpointConfig().setMaxConcurrentCheckpoints(1);
+            env.getCheckpointConfig().setExternalizedCheckpointCleanup(
+                org.apache.flink.streaming.api.environment.CheckpointConfig.ExternalizedCheckpointCleanup.RETAIN_ON_CANCELLATION
+            );
+        }
+
+        // --- State Backend ---
+        String stateBackend = params.get("state.backend", "hashmap").toLowerCase();
+        if ("rocksdb".equals(stateBackend)) {
+            env.setStateBackend(new org.apache.flink.contrib.streaming.state.EmbeddedRocksDBStateBackend());
+        }
+
+        // --- Restart Strategy ---
+        env.setRestartStrategy(org.apache.flink.api.common.restartstrategy.RestartStrategies.failureRateRestart(
+            3,
+            org.apache.flink.api.common.time.Time.minutes(5),
+            org.apache.flink.api.common.time.Time.seconds(10)
+        ));
+
         // --- Kafka Sources Setup ---
         // Data Source: Read from earliest to ensure we process the full dataset for the experiment.
         KafkaSource<String> tupleSrc = KafkaSource.<String>builder()
-                .setBootstrapServers("localhost:9092")
+                .setBootstrapServers(bootstrapServers)
                 .setTopics(inputTopic)
                 .setStartingOffsets(OffsetsInitializer.earliest())
                 .setValueOnlyDeserializer(new SimpleStringSchema())
@@ -90,7 +120,7 @@ public class FlinkSkyline {
 
         // Query Source: Read from latest. Acts as a control stream to trigger computation.
         KafkaSource<String> querySrc = KafkaSource.<String>builder()
-                .setBootstrapServers("localhost:9092")
+                .setBootstrapServers(bootstrapServers)
                 .setTopics(queryTopic)
                 .setStartingOffsets(OffsetsInitializer.latest())
                 .setValueOnlyDeserializer(new SimpleStringSchema())
@@ -175,7 +205,7 @@ public class FlinkSkyline {
 
         // Sink Results to Kafka
         finalResults.sinkTo(KafkaSink.<String>builder()
-                .setBootstrapServers("localhost:9092")
+                .setBootstrapServers(bootstrapServers)
                 .setProperty("max.request.size", "10485760") // Increase max request size for large skyline payloads
                 .setRecordSerializer(KafkaRecordSerializationSchema.builder()
                         .setTopic(outputTopic)
