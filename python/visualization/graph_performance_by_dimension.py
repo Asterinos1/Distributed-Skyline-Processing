@@ -43,6 +43,19 @@ files_4d = {
 }
 
 
+# Color and Marker styling for consistency across subplots
+markers = {
+    'MR-Angle': 'o',
+    'MR-Dim': 's',
+    'MR-Grid': '^'
+}
+
+colors = {
+    'MR-Angle': 'blue',
+    'MR-Dim': 'green',
+    'MR-Grid': 'orange'
+}
+
 # 3. GENERATE PLOTS
 
 def plot_performance_by_dimension():
