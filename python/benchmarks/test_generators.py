@@ -3,8 +3,8 @@ from faker import Faker
 import sys
 import os
 
-# Append python directory to sys.path so we can import unified_producer
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+# Append python/src directory to sys.path so we can import unified_producer
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'src')))
 from unified_producer import generate_uniform_data, generate_correlated_data, generate_anti_correlated_data
 
 @pytest.fixture
