@@ -2,9 +2,10 @@ from confluent_kafka import Producer
 from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroSerializer
-from sys import argv
+import argparse
 import os
 import time
+from common import load_schema, BOOTSTRAP_SERVERS, SCHEMA_REGISTRY_URL
 
 """
 Query Trigger Publisher (Avro Version).
@@ -14,20 +15,22 @@ It publishes a "Query Trigger" message to a Kafka topic, which instructs the Fli
 workers to calculate and emit their local skylines, using Avro serialization.
 """
 
-def load_schema(schema_name):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    schema_path = os.path.join(script_dir, "..", "..", "src", "main", "avro", schema_name)
-    with open(schema_path, "r") as f:
-        return f.read()
+
 
 def send_query_trigger():
     """
     Constructs and sends a single Query Trigger message to Kafka.
     """
     # Parse CLI Arguments with defaults
-    topic_name = argv[1] if len(argv) > 1 else "queries"
-    algo_str = argv[2] if len(argv) > 2 else "mr-dim"
-    trigger_interval = int(argv[3]) if len(argv) > 3 else 60  # in seconds
+    parser = argparse.ArgumentParser(description="Query Trigger Publisher")
+    parser.add_argument("--topic", default="queries", help="Kafka topic for queries")
+    parser.add_argument("--algo", default="mr-dim", help="Skyline algorithm")
+    parser.add_argument("--interval", type=int, default=60, help="Trigger interval in seconds")
+    args = parser.parse_args()
+
+    topic_name = args.topic
+    algo_str = args.algo
+    trigger_interval = args.interval
 
     # --- Algorithm Mapping ---
     algo_map = {
@@ -40,12 +43,12 @@ def send_query_trigger():
     skyline_algorithm = algo_map.get(algo_str.lower(), 1)
 
     # --- Schema Registry & Serializer Setup ---
-    schema_registry_client = SchemaRegistryClient({'url': 'http://localhost:8082'})
+    schema_registry_client = SchemaRegistryClient({'url': SCHEMA_REGISTRY_URL})
     schema_str = load_schema("query_trigger.avsc")
     avro_serializer = AvroSerializer(schema_registry_client, schema_str)
 
     # --- Kafka Producer Initialization ---
-    prod = Producer({'bootstrap.servers': 'localhost:9092'})
+    prod = Producer({'bootstrap.servers': BOOTSTRAP_SERVERS})
     
     print(f"Starting query trigger stream for {skyline_algorithm} ({algo_str}) in Avro format every {trigger_interval} seconds...")
 

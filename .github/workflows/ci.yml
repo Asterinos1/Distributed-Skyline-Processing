@@ -31,7 +31,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: FlinkSkyline-ShadowJar
-          path: target/Skyline-Project-Flink-*-shaded.jar
+          path: target/Skyline-Project-Flink-1.0-SNAPSHOT.jar
           retention-days: 7
 
   # Job 2: Test and lint the Python Generator Scripts

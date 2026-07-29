@@ -33,7 +33,9 @@ import org.apache.flink.util.OutputTag;
 import org.main.avro.ServiceTupleAvro;
 import org.main.avro.QueryTriggerAvro;
 import org.main.avro.SkylineResultAvro;
-
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.io.Serializable;
 import java.util.ArrayList;
@@ -62,6 +64,8 @@ import java.util.Objects;
  */
 public class FlinkSkyline {
 
+    private static final Logger LOG = LoggerFactory.getLogger(FlinkSkyline.class);
+
     /**
      * Main Execution Entry Point.
      *
@@ -73,8 +77,22 @@ public class FlinkSkyline {
      */
     public static void main(String[] args) throws Exception {
         ParameterTool params = ParameterTool.fromArgs(args);
-        if (params.has("config")) {
-            params = ParameterTool.fromPropertiesFile(params.get("config")).mergeWith(params);
+        String configPath = params.get("config");
+        if (configPath == null) {
+            // Check default container path first (mounted via docker-compose)
+            java.io.File containerConfig = new java.io.File("/opt/flink/usrlib/config.properties");
+            if (containerConfig.exists() && containerConfig.isFile()) {
+                configPath = containerConfig.getAbsolutePath();
+            } else {
+                // Fallback to local dev path relative to the project root
+                java.io.File localConfig = new java.io.File("deploy/config.properties");
+                if (localConfig.exists() && localConfig.isFile()) {
+                    configPath = localConfig.getAbsolutePath();
+                }
+            }
+        }
+        if (configPath != null) {
+            params = ParameterTool.fromPropertiesFile(configPath).mergeWith(params);
         }
 
         // --- Parameters ---
@@ -100,6 +118,7 @@ public class FlinkSkyline {
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.setParallelism(parallelism);
         env.getConfig().setGlobalJobParameters(params);
+        LOG.info("Starting Flink Skyline Job with parallelism={}, algo={}, dims={}", parallelism, algo, dims);
 
         // --- Fault Tolerance & Checkpointing ---
         if (params.getBoolean("checkpointing.enabled", false)) {
@@ -158,13 +177,13 @@ public class FlinkSkyline {
         // We configure Flink Event Time and Watermark Strategy with Idleness support.
         org.apache.flink.api.common.eventtime.WatermarkStrategy<ServiceTupleAvro> tupleWatermarkStrategy = 
                 org.apache.flink.api.common.eventtime.WatermarkStrategy
-                        .<ServiceTupleAvro>forMonotonousTimestamps()
+                        .<ServiceTupleAvro>forBoundedOutOfOrderness(java.time.Duration.ofSeconds(3))
                         .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
                         .withIdleness(java.time.Duration.ofSeconds(idlenessSec));
 
         org.apache.flink.api.common.eventtime.WatermarkStrategy<QueryTriggerAvro> queryWatermarkStrategy = 
                 org.apache.flink.api.common.eventtime.WatermarkStrategy
-                        .<QueryTriggerAvro>forMonotonousTimestamps()
+                        .<QueryTriggerAvro>forBoundedOutOfOrderness(java.time.Duration.ofSeconds(3))
                         .withTimestampAssigner((event, timestamp) -> event.getTimestamp())
                         .withIdleness(java.time.Duration.ofSeconds(idlenessSec));
 
@@ -244,7 +263,7 @@ public class FlinkSkyline {
                 .keyBy(e -> e.partitionId);
 
         // Local Processing Phase (Tumbling Window on Event Time)
-        DataStream<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> localSkylines = keyedUnionStream
+        DataStream<LocalSkylineResult> localSkylines = keyedUnionStream
                 .window(TumblingEventTimeWindows.of(Time.milliseconds(windowSizeMs)))
                 .process(new LocalSkylineWindowProcessor(dims))
                 .name("LocalSkylineWindowProcessor");
@@ -254,7 +273,7 @@ public class FlinkSkyline {
         // We key by the Query String (f1) so that all partial results for the exact same query
         // end up at the same Reducer instance.
         DataStream<SkylineResultAvro> finalResults = localSkylines
-                .keyBy(t -> t.f1) // Use f1 (Query String) as key
+                .keyBy(t -> t.queryPayload) // Use queryPayload as key
                 .process(new GlobalSkylineAggregator(numPartitions))
                 .name("GlobalReducer");
 
@@ -285,12 +304,12 @@ public class FlinkSkyline {
      * before performing the final reduction.
      *
      * Input:
-     * - Tuple6 from LocalProcessor (PartitionID, Payload, Timestamps, SkylineList, CPU Metrics).
+     * - LocalSkylineResult from LocalProcessor (PartitionID, Payload, Timestamps, SkylineList, CPU Metrics).
      *
      * Output:
      * - String: A JSON formatted string containing performance metrics and (optionally) the result points.
      */
-    public static class GlobalSkylineAggregator extends KeyedProcessFunction<String, Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>, SkylineResultAvro> {
+    public static class GlobalSkylineAggregator extends KeyedProcessFunction<String, LocalSkylineResult, SkylineResultAvro> {
 
         private final int totalPartitions;
 
@@ -378,7 +397,7 @@ public class FlinkSkyline {
          * @param out   Output collector for the final JSON string.
          */
         @Override
-        public void processElement(Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long> input, Context ctx, Collector<SkylineResultAvro> out) throws Exception {
+        public void processElement(LocalSkylineResult input, Context ctx, Collector<SkylineResultAvro> out) throws Exception {
             List<ServiceTuple> currentGlobal = globalBuffer.value();
             if (currentGlobal == null) currentGlobal = new ArrayList<>();
 
@@ -387,7 +406,7 @@ public class FlinkSkyline {
 
             // Update Timing Stats
             // Track the globally minimum start time to measure total job duration
-            Long incomingStartTime = input.f3;
+            Long incomingStartTime = input.partitionStartTime;
             Long currentMinStart = minStartTimeState.value();
             if (currentMinStart == null || (incomingStartTime != null && incomingStartTime < currentMinStart)) {
                 minStartTimeState.update(incomingStartTime);
@@ -398,15 +417,15 @@ public class FlinkSkyline {
             lastArrivalState.update(now);
 
             // Track maximum CPU usage seen so far (straggler analysis)
-            Long incomingCpu = input.f5;
+            Long incomingCpu = input.cpuTimeMillis;
             Long currentMaxCpu = maxLocalCpuState.value();
             if (currentMaxCpu == null || incomingCpu > currentMaxCpu) {
                 maxLocalCpuState.update(incomingCpu);
             }
 
             // Track Size for Optimality (Ratio of local survivors to global survivors)
-            int partitionId = input.f0;
-            List<ServiceTuple> incoming = input.f4;
+            int partitionId = input.partitionId;
+            List<ServiceTuple> incoming = input.skylinePoints;
             localSkylineSizes.put(partitionId, incoming.size());
 
             // Merge Logic (Incremental BNL)
@@ -451,7 +470,7 @@ public class FlinkSkyline {
 
                 long globalProcessingTime = jobFinishTime - mapFinishTime;
                 long totalProcessingTime = (jobStartTime != null) ? (jobFinishTime - jobStartTime) : 0;
-                long queryLatency = jobFinishTime - input.f2; // trigger time from input
+                long queryLatency = jobFinishTime - input.triggerTimestamp; // trigger time from input
 
                 // Optimality Metric Calculation
                 // Defined as: Average percentage of local skyline points that survived the global prune.
@@ -476,22 +495,20 @@ public class FlinkSkyline {
                 // --- C. Visualization Data (Objective 1) ---
                 // Capped visualization points to 500 to prevent overhead
                 int visualPointsCap = Math.min(currentGlobal.size(), 500);
-                StringBuilder pointsJson = new StringBuilder("[");
+                List<double[]> pointsList = new ArrayList<>(visualPointsCap);
                 for (int i = 0; i < visualPointsCap; i++) {
-                    ServiceTuple s = currentGlobal.get(i);
-                    pointsJson.append("[");
-                    for(int j=0; j<s.values.length; j++) {
-                        pointsJson.append(s.values[j]);
-                        if(j < s.values.length - 1) pointsJson.append(",");
-                    }
-                    pointsJson.append("]");
-                    if(i < visualPointsCap - 1) pointsJson.append(", ");
+                    pointsList.add(currentGlobal.get(i).values);
                 }
-                pointsJson.append("]");
+                String pointsJson = "[]";
+                try {
+                    pointsJson = new ObjectMapper().writeValueAsString(pointsList);
+                } catch (Exception e) {
+                    LOG.error("Failed to serialize points", e);
+                }
 
                 // --- Build Avro Result ---
                 String payload = ctx.getCurrentKey();   // "QueryID,RecordCount"
-                String[] parts = payload.split(",");
+                String[] parts = payload.split("\\|");
                 String qId = parts[0];
                 String recCount = (parts.length > 1) ? parts[1] : "unknown";
 
@@ -512,9 +529,10 @@ public class FlinkSkyline {
                 resultRecord.setGlobalProcessingTimeMs(globalProcessingTime);
                 resultRecord.setTotalProcessingTimeMs(totalProcessingTime);
                 resultRecord.setLatencyMs(queryLatency);
-                resultRecord.setPointsJson(pointsJson.toString());
+                resultRecord.setPointsJson(pointsJson);
 
                 out.collect(resultRecord);
+                LOG.info("Emitted SkylineResult for query {} with {} points", qId, currentGlobal.size());
 
                 // Reset state for next query on this key
                 globalBuffer.clear();
@@ -575,12 +593,15 @@ public class FlinkSkyline {
                     if (parsed != null) {
                         out.collect(parsed);
                     } else {
+                        LOG.warn("Invalid tuple routed to DLQ: {}", value);
                         ctx.output(dlqTag, value);
                     }
                 } else {
+                    LOG.warn("Invalid tuple routed to DLQ: {}", value);
                     ctx.output(dlqTag, value);
                 }
             } catch (Exception e) {
+                LOG.warn("Exception validating tuple, routed to DLQ: {}", value, e);
                 ctx.output(dlqTag, value);
             }
         }
@@ -704,7 +725,7 @@ public class FlinkSkyline {
      * on partitioned streams.
      */
     public static class LocalSkylineWindowProcessor 
-            extends ProcessWindowFunction<PartitionEvent, Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>, Integer, TimeWindow> {
+            extends ProcessWindowFunction<PartitionEvent, LocalSkylineResult, Integer, TimeWindow> {
 
         private transient ListState<ServiceTuple> localSkylineState;
         private transient ValueState<Long> startTimeState;
@@ -746,7 +767,7 @@ public class FlinkSkyline {
                 Integer partitionId,
                 Context context,
                 Iterable<PartitionEvent> elements,
-                Collector<Tuple6<Integer, String, Long, Long, List<ServiceTuple>, Long>> out) throws Exception {
+                Collector<LocalSkylineResult> out) throws Exception {
 
             long startNano = System.nanoTime();
 
@@ -818,7 +839,7 @@ public class FlinkSkyline {
                 long totalCpuMillis = totalCpuNanos / 1_000_000L;
 
                 for (PartitionEvent query : queries) {
-                    String queryPayload = query.queryId + "," + query.requiredCount;
+                    String queryPayload = query.queryId + "|" + query.requiredCount;
                     long triggerDispatchTime = query.timestamp;
 
                     List<ServiceTuple> results = new ArrayList<>();
@@ -828,7 +849,7 @@ public class FlinkSkyline {
                         results.add(copy);
                     }
 
-                    out.collect(new Tuple6<>(
+                    out.collect(new LocalSkylineResult(
                             partitionId,
                             queryPayload,
                             triggerDispatchTime,

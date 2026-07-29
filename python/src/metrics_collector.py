@@ -2,6 +2,7 @@ import csv
 import sys
 import os
 import json
+from common import load_schema, BOOTSTRAP_SERVERS, SCHEMA_REGISTRY_URL
 from confluent_kafka import Consumer
 from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
@@ -19,18 +20,14 @@ structured CSV file for easier analysis and plotting later.
 # Configuration Constants
 TOPIC = "output-skyline"
 
-def load_schema(schema_name):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    schema_path = os.path.join(script_dir, "..", "..", "src", "main", "avro", schema_name)
-    with open(schema_path, "r") as f:
-        return f.read()
+
 
 def collect_metrics(output_filename):
     # Check if file exists to decide if we need to write headers
     file_exists = os.path.isfile(output_filename)
     
     # Initialize Schema Registry and Deserializer
-    schema_registry_client = SchemaRegistryClient({'url': 'http://localhost:8082'})
+    schema_registry_client = SchemaRegistryClient({'url': SCHEMA_REGISTRY_URL})
     schema_str = load_schema("skyline_result.avsc")
     avro_deserializer = AvroDeserializer(schema_registry_client, schema_str)
 
@@ -39,7 +36,7 @@ def collect_metrics(output_filename):
     # after this collector has started, avoiding processing stale data from previous runs.
     print(f"--- Listening on topic '{TOPIC}' ---")
     consumer_conf = {
-        'bootstrap.servers': 'localhost:9092',
+        'bootstrap.servers': BOOTSTRAP_SERVERS,
         'group.id': 'metrics-collector-group',
         'auto.offset.reset': 'latest'
     }

@@ -2,6 +2,7 @@ package org.main;
 
 import java.io.Serializable;
 import java.util.Arrays;
+import java.util.Objects;
 
 /**
  * Data Model for a Multi-Dimensional Service Tuple.
@@ -153,5 +154,18 @@ public class ServiceTuple implements Serializable {
     @Override
     public String toString() {
         return "ID:" + id + " " + Arrays.toString(values);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        ServiceTuple that = (ServiceTuple) o;
+        return Objects.equals(id, that.id);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(id);
     }
 }

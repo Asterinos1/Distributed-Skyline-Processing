@@ -10,6 +10,7 @@ from confluent_kafka.serialization import SerializationContext, MessageField
 from confluent_kafka.schema_registry import SchemaRegistryClient
 from confluent_kafka.schema_registry.avro import AvroDeserializer
 import os
+from common import load_schema, BOOTSTRAP_SERVERS, SCHEMA_REGISTRY_URL
 
 # Configure Logging
 logging.basicConfig(level=logging.INFO)
@@ -33,7 +34,7 @@ app = FastAPI(title="Skyline Real-time WebSocket Bridge", lifespan=lifespan)
 # Enable CORS for frontend dashboard
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.environ.get("CORS_ORIGINS", "http://localhost:5173,http://localhost:3000").split(","),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -42,11 +43,7 @@ app.add_middleware(
 # Keep track of active websocket connections
 active_connections = set()
 
-def load_schema(schema_name):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    schema_path = os.path.join(script_dir, "..", "..", "src", "main", "avro", schema_name)
-    with open(schema_path, "r") as f:
-        return f.read()
+
 
 async def kafka_consumer_loop():
     """
@@ -58,7 +55,7 @@ async def kafka_consumer_loop():
 
     try:
         # Initialize Schema Registry and Deserializer
-        schema_registry_client = SchemaRegistryClient({'url': 'http://localhost:8082'})
+        schema_registry_client = SchemaRegistryClient({'url': SCHEMA_REGISTRY_URL})
         schema_str = load_schema("skyline_result.avsc")
         avro_deserializer = AvroDeserializer(schema_registry_client, schema_str)
 
@@ -67,7 +64,7 @@ async def kafka_consumer_loop():
         # when it starts, so the dashboard populates immediately even if the bridge
         # was started after a query result was already produced.
         consumer_conf = {
-            'bootstrap.servers': 'localhost:9092',
+            'bootstrap.servers': BOOTSTRAP_SERVERS,
             'group.id': 'websocket-bridge-group',
             'auto.offset.reset': 'earliest'
         }

@@ -261,7 +261,7 @@ export default function App() {
   const [selectedXDim, setSelectedXDim] = useState<number>(0);
   const [selectedYDim, setSelectedYDim] = useState<number>(1);
   const wsRef = useRef<WebSocket | null>(null);
-  const reconnectTimeoutRef = useRef<any>(null);
+  const reconnectTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   useEffect(() => {
     connect();
@@ -279,7 +279,7 @@ export default function App() {
 
   function connect() {
     setStatus("connecting");
-    const ws = new WebSocket("ws://localhost:8000/ws");
+    const ws = new WebSocket(import.meta.env.VITE_WS_URL || "ws://localhost:8000/ws");
     wsRef.current = ws;
     ws.onopen = () => setStatus("connected");
     ws.onmessage = (e) => {

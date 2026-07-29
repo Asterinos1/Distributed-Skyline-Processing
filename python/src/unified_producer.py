@@ -8,6 +8,7 @@ from enum import Enum
 from sys import argv
 import os
 import time
+from common import load_schema, BOOTSTRAP_SERVERS, SCHEMA_REGISTRY_URL
 
 """
 Synthetic Data Stream Generator for Skyline Queries.
@@ -45,11 +46,7 @@ class GenMethod(Enum):
     def from_str(cls, label):
         return cls(label.lower())
 
-def load_schema(schema_name):
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    schema_path = os.path.join(script_dir, "..", "..", "src", "main", "avro", schema_name)
-    with open(schema_path, "r") as f:
-        return f.read()
+
 
 """
 Generates a data point with independent random values for each dimension.
@@ -166,7 +163,7 @@ def run_generator():
 
     # Initialize Schema Registry client and Avro Serializers
 
-    schema_registry_client = SchemaRegistryClient({'url': 'http://localhost:8082'})
+    schema_registry_client = SchemaRegistryClient({'url': SCHEMA_REGISTRY_URL})
     tuple_schema_str = load_schema("service_tuple.avsc")
     query_schema_str = load_schema("query_trigger.avsc")
     
@@ -177,7 +174,7 @@ def run_generator():
     # queue.buffering.max.messages is raised from the default 100k to prevent
     # BufferError crashes during high-throughput bursts (e.g. at the 1M query trigger).
     prod = Producer({
-        'bootstrap.servers': 'localhost:9092',
+        'bootstrap.servers': BOOTSTRAP_SERVERS,
         'queue.buffering.max.messages': 500000,
         'queue.buffering.max.kbytes': 524288,  # 512 MB
     })

@@ -103,4 +103,15 @@ public class FlinkSkylineTest {
         assertNotNull(key2);
         assertTrue(key1 < key2, "Points closer to X-axis should have smaller partition keys than Y-axis");
     }
+
+
+    @Test
+    public void testLocalSkylineResultPOJO() {
+        List<ServiceTuple> points = Arrays.asList(new ServiceTuple("1", new double[]{1.0, 2.0}));
+        LocalSkylineResult result = new LocalSkylineResult(1, "q1|100", 1000L, 500L, points, 10L);
+        
+        assertEquals(1, result.partitionId);
+        assertEquals("q1|100", result.queryPayload);
+        assertEquals(1, result.skylinePoints.size());
+    }
 }
